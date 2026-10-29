@@ -46,3 +46,17 @@ Open the Vercel link in Safari, tap Share, then **Add to Home Screen**, and open
 - Sentences are generated on a background worker with several threads when the browser allows it.
 - The engine files are served from the app itself (no CDN), so they are cached for offline use.
 - "Fast" voices (marked *Faster, lighter*) trade some quality for speed.
+
+## License
+
+ListenList's own code is released under the [MIT License](LICENSE).
+
+### Third-party components
+
+ListenList uses open-source components that keep their own licenses:
+
+- [ONNX Runtime Web](https://github.com/microsoft/onnxruntime) (MIT) runs the voice model.
+- [piper-wasm](https://github.com/diffusionstudio/piper-wasm) (MIT) provides the phonemizer, which is built on
+  [espeak-ng](https://github.com/espeak-ng/espeak-ng) (GPL-3.0).
+- [Piper](https://github.com/rhasspy/piper) voice models are downloaded from Hugging Face the first time you press
+  Listen. Each voice has its own license; see its model card before redistributing audio commercially.
