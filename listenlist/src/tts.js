@@ -1,21 +1,25 @@
 // On-device text-to-speech (Piper voices running in the browser via ONNX/WASM).
 // The voice model downloads once (~60MB), is stored on the device, and every
 // list is turned into one audio file that plays offline afterwards.
+// The heavy lifting happens in /tts-worker.js (model loaded once, several threads when available).
+
+const HF = 'https://huggingface.co/diffusionstudio/piper-voices/resolve/main';
+const voice = (id, label, hint, path) => ({ id, label, hint, modelUrl: `${HF}/${path}/${id}.onnx`, configUrl: `${HF}/${path}/${id}.onnx.json` });
 
 export const VOICES = [
-  { id: 'en_US-hfc_female-medium', label: 'Female · natural' },
-  { id: 'en_US-hfc_male-medium', label: 'Male · natural' },
-  { id: 'en_GB-alba-medium', label: 'Female · British' },
-  { id: 'en_US-amy-low', label: 'Female · compact file' },
+  voice('en_US-hfc_female-medium', 'Female · Natural', 'Best quality', 'en/en_US/hfc_female/medium'),
+  voice('en_US-hfc_male-medium', 'Male · Natural', 'Best quality', 'en/en_US/hfc_male/medium'),
+  voice('en_GB-alba-medium', 'Female · British', 'Best quality', 'en/en_GB/alba/medium'),
+  voice('en_US-amy-low', 'Female · Fast', 'Faster, lighter', 'en/en_US/amy/low'),
+  voice('en_US-ryan-low', 'Male · Fast', 'Faster, lighter', 'en/en_US/ryan/low'),
 ];
 export const DEFAULT_VOICE = VOICES[0].id;
 export const MAX_WORDS = 5000;
 
-const CHUNK_CHARS = 240; // sentences are grouped up to this size per synthesis call
-const MAX_PIECE = 280; // a single very long sentence gets split below this
-
-let vitsPromise;
-const loadVits = () => (vitsPromise ||= import('@diffusionstudio/vits-web'));
+const CHUNK_CHARS = 260; // sentences are grouped up to this size per synthesis call
+const MAX_PIECE = 300; // a single very long sentence gets split below this
+const VOICE_CACHE = 'listenlist-voices-v1';
+const APPROX_MODEL_BYTES = 63e6;
 
 /* ---------- text helpers ---------- */
 
@@ -111,31 +115,11 @@ export function planChunks(text) {
   return chunks;
 }
 
-/* ---------- WAV helpers ---------- */
-
-function readWav(buf) {
-  const v = new DataView(buf);
-  const sampleRate = v.getUint32(24, true);
-  const bits = v.getUint16(34, true);
-  let pos = 12;
-  while (pos + 8 <= v.byteLength) {
-    const id = String.fromCharCode(v.getUint8(pos), v.getUint8(pos + 1), v.getUint8(pos + 2), v.getUint8(pos + 3));
-    const size = v.getUint32(pos + 4, true);
-    if (id === 'data') {
-      const len = Math.min(size, v.byteLength - (pos + 8));
-      if (bits !== 16) throw new Error('Unexpected audio format');
-      const samples = new Int16Array(len >> 1);
-      for (let i = 0; i < samples.length; i++) samples[i] = v.getInt16(pos + 8 + i * 2, true);
-      return { sampleRate, samples };
-    }
-    pos += 8 + size + (size & 1);
-  }
-  throw new Error('Could not read audio');
-}
+/* ---------- WAV ---------- */
 
 function wavHeader(sampleRate, numSamples) {
   const h = new DataView(new ArrayBuffer(44));
-  const w = (o, s) => [...s].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
+  const w = (o, str) => [...str].forEach((c, i) => h.setUint8(o + i, c.charCodeAt(0)));
   w(0, 'RIFF');
   h.setUint32(4, 36 + numSamples * 2, true);
   w(8, 'WAVE');
@@ -152,76 +136,188 @@ function wavHeader(sampleRate, numSamples) {
   return h.buffer;
 }
 
+/* ---------- voice files (stored on the device in Cache Storage) ---------- */
+
+async function hasVoice(v) {
+  const cache = await caches.open(VOICE_CACHE);
+  return !!(await cache.match(v.modelUrl)) && !!(await cache.match(v.configUrl));
+}
+
+/** Older versions kept voices in the browser's private file system; reuse them instead of downloading again. */
+async function importLegacyVoice(v) {
+  try {
+    const dir = await (await navigator.storage.getDirectory()).getDirectoryHandle('piper');
+    const read = async (url) => (await (await dir.getFileHandle(url.split('/').at(-1))).getFile());
+    const [model, conf] = [await read(v.modelUrl), await read(v.configUrl)];
+    const cache = await caches.open(VOICE_CACHE);
+    await cache.put(v.configUrl, new Response(conf));
+    await cache.put(v.modelUrl, new Response(model));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function downloadVoice(v, onStatus) {
+  const cache = await caches.open(VOICE_CACHE);
+  const confRes = await fetch(v.configUrl);
+  if (!confRes.ok) throw new Error('Could not download the voice (' + confRes.status + ')');
+  await cache.put(v.configUrl, confRes);
+
+  const res = await fetch(v.modelUrl);
+  if (!res.ok || !res.body) throw new Error('Could not download the voice (' + res.status + ')');
+  const total = Number(res.headers.get('Content-Length')) || APPROX_MODEL_BYTES;
+  const reader = res.body.getReader();
+  const parts = [];
+  let loaded = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    loaded += value.length;
+    onStatus({ phase: 'model', percent: Math.min(99, Math.round((loaded / total) * 100)) });
+  }
+  await cache.put(v.modelUrl, new Response(new Blob(parts), { headers: { 'Content-Type': 'application/octet-stream' } }));
+}
+
+export async function voiceIsOnDevice(voiceId) {
+  try {
+    const v = VOICES.find((x) => x.id === voiceId);
+    return !!v && (await hasVoice(v));
+  } catch {
+    return false;
+  }
+}
+
+/* ---------- worker ---------- */
+
+function startWorker(v, threads) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker('/tts-worker.js');
+    const fail = (message) => {
+      worker.terminate();
+      reject(new Error(message));
+    };
+    worker.onerror = (e) => fail(e.message || 'The voice engine failed to start.');
+    worker.onmessage = (e) => {
+      if (e.data.type === 'ready') {
+        worker.onmessage = worker.onerror = null;
+        resolve(worker);
+      } else if (e.data.type === 'error') fail(e.data.message);
+    };
+    worker.postMessage({ type: 'init', modelUrl: v.modelUrl, configUrl: v.configUrl, threads });
+  });
+}
+
+function pickThreads() {
+  if (!self.crossOriginIsolated) return 1;
+  let flag = false;
+  try {
+    flag = localStorage.getItem('noThreads') === '1';
+  } catch {}
+  if (flag) return 1;
+  return Math.max(1, Math.min(4, navigator.hardwareConcurrency || 2));
+}
+
+async function openWorker(v) {
+  const threads = pickThreads();
+  try {
+    return await startWorker(v, threads);
+  } catch (err) {
+    if (threads === 1) throw err;
+    // Multi-threading may not be available on this device: try a single thread, and only if that works remember it.
+    let worker;
+    try {
+      worker = await startWorker(v, 1);
+    } catch {
+      throw err;
+    }
+    try {
+      localStorage.setItem('noThreads', '1');
+    } catch {}
+    return worker;
+  }
+}
+
 /* ---------- generation ---------- */
 
 /**
  * Turn text into a single WAV file plus sentence timestamps ("cues").
- * onStatus({ phase: 'model'|'audio', percent, done, total, etaSec })
+ * onStatus({ phase: 'model'|'engine'|'audio', percent, done, total, etaSec })
  */
 export async function generateAudio({ text, voiceId, onStatus, isCancelled }) {
   const chunks = planChunks(text);
   if (!chunks.length) throw new Error('There is no readable text in this list yet.');
+  const v = VOICES.find((x) => x.id === voiceId) || VOICES[0];
 
-  const vits = await loadVits();
-
-  // 1) make sure the voice model is on this device
-  const stored = await vits.stored().catch(() => []);
-  if (!stored.includes(voiceId)) {
-    const seen = new Map();
-    await vits.download(voiceId, (p) => {
-      seen.set(p.url, p);
-      let loaded = 0;
-      let total = 0;
-      seen.forEach((x) => {
-        loaded += x.loaded;
-        total += x.total;
-      });
-      onStatus({ phase: 'model', percent: total ? Math.round((loaded / total) * 100) : 0 });
-    });
+  // 1) make sure the voice is on this device
+  if (!(await hasVoice(v)) && !(await importLegacyVoice(v))) {
+    await downloadVoice(v, onStatus);
   }
   if (isCancelled()) throw new Error('cancelled');
 
-  // 2) synthesize chunk by chunk
+  // 2) start the engine once
+  onStatus({ phase: 'engine', percent: 0 });
+  const worker = await openWorker(v);
+  if (isCancelled()) {
+    worker.terminate();
+    throw new Error('cancelled');
+  }
+
+  // 3) synthesize all chunks in the worker, receiving audio as it is produced
   const parts = [];
   const cues = [];
-  let sampleRate = 0;
+  let sampleRate = 22050;
   let totalSamples = 0;
   let charsDone = 0;
   const totalChars = chunks.reduce((n, c) => n + c.spoken.length, 0);
   const t0 = performance.now();
 
-  for (let i = 0; i < chunks.length; i++) {
-    if (isCancelled()) throw new Error('cancelled');
-    const c = chunks[i];
-    let wav;
-    try {
-      wav = await vits.predict({ text: c.spoken, voiceId });
-    } catch (err) {
-      if (isCancelled()) throw new Error('cancelled');
-      wav = await vits.predict({ text: c.spoken, voiceId }); // one retry
-    }
-    const { sampleRate: sr, samples } = readWav(await wav.arrayBuffer());
-    sampleRate ||= sr;
+  try {
+    await new Promise((resolve, reject) => {
+      const poll = setInterval(() => {
+        if (isCancelled()) {
+          clearInterval(poll);
+          reject(new Error('cancelled'));
+        }
+      }, 250);
+      const end = (fn, arg) => {
+        clearInterval(poll);
+        fn(arg);
+      };
+      worker.onerror = (e) => end(reject, new Error(e.message || 'The voice engine stopped unexpectedly.'));
+      worker.onmessage = (e) => {
+        const m = e.data;
+        if (m.type === 'error') return end(reject, new Error(m.message));
+        if (m.type === 'done') return end(resolve);
+        if (m.type !== 'chunk') return;
 
-    const pause = new Int16Array(Math.round(sampleRate * (c.paraEnd ? 0.7 : 0.25)));
-    parts.push(samples, pause);
+        const c = chunks[m.i];
+        sampleRate = m.sampleRate;
+        const pause = new Int16Array(Math.round(sampleRate * (c.paraEnd ? 0.7 : 0.25)));
+        parts.push(m.samples, pause);
 
-    // spread the chunk's duration over its sentences by length
-    const chunkStart = totalSamples / sampleRate;
-    const chunkDur = (samples.length + pause.length) / sampleRate;
-    const weight = c.sents.reduce((n, s) => n + s.spoken.length, 0);
-    let acc = 0;
-    for (const s of c.sents) {
-      const a = acc / weight;
-      acc += s.spoken.length;
-      cues.push({ s: s.start, e: s.end, t0: chunkStart + a * chunkDur, t1: chunkStart + (acc / weight) * chunkDur });
-    }
-    totalSamples += samples.length + pause.length;
+        // spread this chunk's duration over its sentences by length
+        const chunkStart = totalSamples / sampleRate;
+        const chunkDur = (m.samples.length + pause.length) / sampleRate;
+        const weight = c.sents.reduce((n, s) => n + s.spoken.length, 0);
+        let acc = 0;
+        for (const s of c.sents) {
+          const a = acc / weight;
+          acc += s.spoken.length;
+          cues.push({ s: s.start, e: s.end, t0: chunkStart + a * chunkDur, t1: chunkStart + (acc / weight) * chunkDur });
+        }
+        totalSamples += m.samples.length + pause.length;
 
-    charsDone += c.spoken.length;
-    const elapsed = (performance.now() - t0) / 1000;
-    const etaSec = charsDone > 300 ? Math.round((elapsed / charsDone) * (totalChars - charsDone)) : null;
-    onStatus({ phase: 'audio', percent: Math.round((charsDone / totalChars) * 100), done: i + 1, total: chunks.length, etaSec });
+        charsDone += c.spoken.length;
+        const elapsed = (performance.now() - t0) / 1000;
+        const etaSec = charsDone > 300 ? Math.round((elapsed / charsDone) * (totalChars - charsDone)) : null;
+        onStatus({ phase: 'audio', percent: Math.round((charsDone / totalChars) * 100), done: m.i + 1, total: chunks.length, etaSec });
+      };
+      worker.postMessage({ type: 'run', texts: chunks.map((c) => c.spoken) });
+    });
+  } finally {
+    worker.terminate(); // frees the model memory (important on phones)
   }
 
   const blob = new Blob([wavHeader(sampleRate, totalSamples), ...parts], { type: 'audio/wav' });

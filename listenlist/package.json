@@ -4,14 +4,18 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/copy-vendor.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/copy-vendor.mjs",
     "build": "vite build",
+    "prepreview": "node scripts/copy-vendor.mjs",
     "preview": "vite preview"
   },
   "devDependencies": {
     "vite": "^8.3.5"
   },
   "dependencies": {
-    "@diffusionstudio/vits-web": "^1.0.3"
+    "@diffusionstudio/piper-wasm": "1.0.0",
+    "onnxruntime-web": "1.18.0"
   }
 }

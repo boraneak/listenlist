@@ -1,7 +1,13 @@
 import { defineConfig } from 'vite';
 
+// Cross-origin isolation lets the voice engine use several CPU threads (much faster).
+const isolation = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'require-corp',
+};
+
 export default defineConfig({
-  optimizeDeps: { exclude: ['@diffusionstudio/vits-web'] },
-  worker: { format: 'es' },
-  build: { target: 'es2020', chunkSizeWarningLimit: 1500 },
+  build: { target: 'es2020' },
+  server: { headers: isolation },
+  preview: { headers: isolation },
 });
