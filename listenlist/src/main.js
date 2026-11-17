@@ -188,11 +188,23 @@ function renderHome() {
   cur = null;
   app.innerHTML = `
     <section class="screen" id="home">
-      <div class="bar"><div class="brand">${LOGO}<span>Listen<i>List</i></span></div></div>
+      <div class="bar">
+        <div class="brand">${LOGO}<span>Listen<i>List</i></span></div>
+        <button class="text-btn" id="about">About</button>
+      </div>
       <div class="scroll" id="scroll"></div>
       <button class="fab" id="new">${I.plus} New list</button>
     </section>`;
   $('#new').onclick = newList;
+  $('#about').onclick = () => {
+    const sheet = openSheet(`
+      <h2>About ListenList</h2>
+      <p>Paste text, choose a voice, and create speech in your browser. ListenList processes your text on this device; it does not upload it.</p>
+      <p>Each voice needs an internet connection for its first download (about 60 MB). After that, you can generate speech offline when the app files and voice are still available in browser storage.</p>
+      <p>Your lists and generated audio are stored in this browser and may be removed if browser data is cleared or evicted. Export audio you want to keep. Audio downloads as a WAV file.</p>
+      <div class="cta" style="padding:0"><button class="btn" id="aboutClose">Close</button></div>`);
+    $('#aboutClose', sheet.el).onclick = () => sheet.close();
+  };
   renderHomeBody();
 }
 
