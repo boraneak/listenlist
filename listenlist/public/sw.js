@@ -1,51 +1,100 @@
-// Offline support: the app shell and the voice-engine files are cached on first use.
-// Voice models live in Cache Storage ("listenlist-voices-v1") and are never touched here.
-const CACHE = 'listenlist-v2';
+// The app shell is precached; engine files are cached as they are requested.
+// Voice models use their own Cache Storage cache and are not changed here.
+const CACHE = 'listenlist-v3';
+const STATIC_FILES = [
+  '/manifest.webmanifest',
+  '/favicon.svg',
+  '/apple-touch-icon.png',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/icon-maskable-512.png',
+];
 
-self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(['/', '/manifest.webmanifest', '/favicon.svg'])).then(() => self.skipWaiting()));
+async function precacheAppShell(cache) {
+  const response = await fetch('/');
+  if (!response.ok) throw new Error(`Could not cache the app shell (${response.status}).`);
+  await cache.put('/', response.clone());
+
+  const html = await response.text();
+  const resources = new Set(
+    [...html.matchAll(/(?:src|href)=["']([^"']+)["']/g)]
+      .map(([, path]) => new URL(path, self.location.origin))
+      .filter((url) => url.origin === self.location.origin && /\.(?:js|css)$/.test(url.pathname))
+      .map((url) => url.href)
+  );
+  await Promise.all(
+    [...resources].map(async (url) => {
+      const asset = await fetch(url);
+      if (!asset.ok) throw new Error(`Could not cache an app asset (${asset.status}): ${url}`);
+      await cache.put(url, asset);
+    })
+  );
+}
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open(CACHE);
+      await Promise.all([precacheAppShell(cache), cache.addAll(STATIC_FILES)]);
+    })()
+  );
 });
 
-self.addEventListener('activate', (e) => {
-  e.waitUntil(
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k.startsWith('listenlist-v') && k !== CACHE && !k.startsWith('listenlist-voices')).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((key) => key.startsWith('listenlist-v') && key !== CACHE && !key.startsWith('listenlist-voices')).map((key) => caches.delete(key))))
       .then(() => self.clients.claim())
   );
 });
 
-self.addEventListener('fetch', (e) => {
-  const req = e.request;
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
   if (req.method !== 'GET' || req.headers.has('range')) return;
   const url = new URL(req.url);
-  if (url.origin !== location.origin) return; // voice models come straight from the network / Cache Storage
+  if (url.origin !== self.location.origin) return;
 
-  // Page loads: network first, fall back to the cached shell when offline.
   if (req.mode === 'navigate') {
-    e.respondWith(
-      fetch(req)
-        .then((res) => {
-          const copy = res.clone();
-          caches.open(CACHE).then((c) => c.put('/', copy));
-          return res;
-        })
-        .catch(() => caches.match('/'))
+    event.respondWith(
+      (async () => {
+        try {
+          const response = await fetch(req);
+          if (response.ok) {
+            try {
+              const cache = await caches.open(CACHE);
+              await cache.put('/', response.clone());
+            } catch (error) {
+              console.warn('Could not update the cached app shell.', error);
+            }
+          }
+          return response;
+        } catch {
+          const cached = await caches.match('/');
+          if (cached) return cached;
+          return new Response('ListenList is offline and the app shell is not cached yet.', {
+            status: 503,
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+          });
+        }
+      })()
     );
     return;
   }
 
-  // Everything else (scripts, styles, icons, engine files): cache first, then network.
-  e.respondWith(
-    caches.match(req).then(
-      (hit) =>
-        hit ||
-        fetch(req).then((res) => {
-          if (res && res.status === 200) {
-            const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(req, copy));
-          }
-          return res;
-        })
-    )
+  event.respondWith(
+    (async () => {
+      const cached = await caches.match(req);
+      if (cached) return cached;
+      const response = await fetch(req);
+      if (response.ok) {
+        try {
+          const cache = await caches.open(CACHE);
+          await cache.put(req, response.clone());
+        } catch (error) {
+          console.warn('Could not cache an app resource.', req.url, error);
+        }
+      }
+      return response;
+    })()
   );
 });

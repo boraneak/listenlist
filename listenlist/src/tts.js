@@ -28,15 +28,8 @@ export function countWords(text) {
   return m ? m.length : 0;
 }
 
-/** Cut text to the first MAX_WORDS words. Returns the (possibly shortened) text. */
-export function clampWords(text, max = MAX_WORDS) {
-  const re = /\S+/g;
-  let n = 0;
-  let m;
-  while ((m = re.exec(text))) {
-    if (++n > max) return text.slice(0, m.index).trimEnd();
-  }
-  return text;
+export function isWithinWordLimit(text, max = MAX_WORDS) {
+  return countWords(text) <= max;
 }
 
 export function hashOf(text, voice) {
@@ -158,25 +151,41 @@ async function importLegacyVoice(v) {
   }
 }
 
-async function downloadVoice(v, onStatus) {
+function abortError() {
+  return new DOMException('The operation was cancelled.', 'AbortError');
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortError();
+}
+
+async function downloadVoice(v, onStatus, signal) {
   const cache = await caches.open(VOICE_CACHE);
-  const confRes = await fetch(v.configUrl);
+  throwIfAborted(signal);
+  const confRes = await fetch(v.configUrl, { signal });
   if (!confRes.ok) throw new Error('Could not download the voice (' + confRes.status + ')');
   await cache.put(v.configUrl, confRes);
 
-  const res = await fetch(v.modelUrl);
+  throwIfAborted(signal);
+  const res = await fetch(v.modelUrl, { signal });
   if (!res.ok || !res.body) throw new Error('Could not download the voice (' + res.status + ')');
   const total = Number(res.headers.get('Content-Length')) || APPROX_MODEL_BYTES;
   const reader = res.body.getReader();
   const parts = [];
   let loaded = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    loaded += value.length;
-    onStatus({ phase: 'model', percent: Math.min(99, Math.round((loaded / total) * 100)) });
+  try {
+    for (;;) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      loaded += value.length;
+      onStatus({ phase: 'model', percent: Math.min(99, Math.round((loaded / total) * 100)) });
+    }
+  } finally {
+    reader.releaseLock();
   }
+  throwIfAborted(signal);
   await cache.put(v.modelUrl, new Response(new Blob(parts), { headers: { 'Content-Type': 'application/octet-stream' } }));
 }
 
@@ -191,17 +200,30 @@ export async function voiceIsOnDevice(voiceId) {
 
 /* ---------- worker ---------- */
 
-function startWorker(v, threads) {
+function startWorker(v, threads, signal) {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const worker = new Worker('/tts-worker.js');
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+      worker.onmessage = null;
+      worker.onerror = null;
+    };
     const fail = (message) => {
+      cleanup();
       worker.terminate();
       reject(new Error(message));
     };
+    const onAbort = () => {
+      cleanup();
+      worker.terminate();
+      reject(abortError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
     worker.onerror = (e) => fail(e.message || 'The voice engine failed to start.');
     worker.onmessage = (e) => {
       if (e.data.type === 'ready') {
-        worker.onmessage = worker.onerror = null;
+        cleanup();
         resolve(worker);
       } else if (e.data.type === 'error') fail(e.data.message);
     };
@@ -219,18 +241,18 @@ function pickThreads() {
   return Math.max(1, Math.min(4, navigator.hardwareConcurrency || 2));
 }
 
-async function openWorker(v) {
+async function openWorker(v, signal) {
   const threads = pickThreads();
   try {
-    return await startWorker(v, threads);
+    return await startWorker(v, threads, signal);
   } catch (err) {
-    if (threads === 1) throw err;
+    if (signal?.aborted || threads === 1) throw err;
     // Multi-threading may not be available on this device: try a single thread, and only if that works remember it.
     let worker;
     try {
-      worker = await startWorker(v, 1);
+      worker = await startWorker(v, 1, signal);
     } catch {
-      throw err;
+      throw signal?.aborted ? abortError() : err;
     }
     try {
       localStorage.setItem('noThreads', '1');
@@ -245,24 +267,21 @@ async function openWorker(v) {
  * Turn text into a single WAV file plus sentence timestamps ("cues").
  * onStatus({ phase: 'model'|'engine'|'audio', percent, done, total, etaSec })
  */
-export async function generateAudio({ text, voiceId, onStatus, isCancelled }) {
+export async function generateAudio({ text, voiceId, onStatus, signal }) {
+  if (!isWithinWordLimit(text)) throw new Error(`The limit is ${MAX_WORDS.toLocaleString()} words. Shorten the text to create audio; your full draft is preserved.`);
   const chunks = planChunks(text);
   if (!chunks.length) throw new Error('There is no readable text in this list yet.');
   const v = VOICES.find((x) => x.id === voiceId) || VOICES[0];
 
   // 1) make sure the voice is on this device
   if (!(await hasVoice(v)) && !(await importLegacyVoice(v))) {
-    await downloadVoice(v, onStatus);
+    await downloadVoice(v, onStatus, signal);
   }
-  if (isCancelled()) throw new Error('cancelled');
+  throwIfAborted(signal);
 
   // 2) start the engine once
   onStatus({ phase: 'engine', percent: 0 });
-  const worker = await openWorker(v);
-  if (isCancelled()) {
-    worker.terminate();
-    throw new Error('cancelled');
-  }
+  const worker = await openWorker(v, signal);
 
   // 3) synthesize all chunks in the worker, receiving audio as it is produced
   const parts = [];
@@ -274,17 +293,19 @@ export async function generateAudio({ text, voiceId, onStatus, isCancelled }) {
   const t0 = performance.now();
 
   try {
+    throwIfAborted(signal);
     await new Promise((resolve, reject) => {
-      const poll = setInterval(() => {
-        if (isCancelled()) {
-          clearInterval(poll);
-          reject(new Error('cancelled'));
-        }
-      }, 250);
+      let settled = false;
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
       const end = (fn, arg) => {
-        clearInterval(poll);
+        if (settled) return;
+        settled = true;
+        cleanup();
         fn(arg);
       };
+      const onAbort = () => end(reject, abortError());
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) return onAbort();
       worker.onerror = (e) => end(reject, new Error(e.message || 'The voice engine stopped unexpectedly.'));
       worker.onmessage = (e) => {
         const m = e.data;

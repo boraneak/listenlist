@@ -9,7 +9,8 @@
     "prebuild": "node scripts/copy-vendor.mjs",
     "build": "vite build",
     "prepreview": "node scripts/copy-vendor.mjs",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node --test"
   },
   "devDependencies": {
     "vite": "^8.3.5"

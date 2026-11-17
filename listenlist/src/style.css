@@ -5,10 +5,10 @@
   --surface: #ffffff;
   --surface-2: #f3eee6;
   --ink: #1d1b19;
-  --muted: #7a746c;
+  --muted: #6f6961;
   --line: #e9e3d9;
-  --accent: #d9480f;
-  --accent-2: #ff8a4c;
+  --accent: #b7380b;
+  --accent-2: #c74816;
   --accent-ink: #ffffff;
   --accent-soft: #fde9dc;
   --hl: #ffe7b8;
@@ -112,6 +112,7 @@ svg { display: block; flex: none; }
   font-size: 19px; font-weight: 700; letter-spacing: -0.01em; text-align: center; text-overflow: ellipsis;
 }
 .title-input::placeholder { color: var(--muted); font-weight: 600; }
+.title-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; border-radius: 4px; }
 .title-text {
   flex: 1; min-width: 0; text-align: center; font-size: 17px; font-weight: 700; letter-spacing: -0.01em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -126,6 +127,7 @@ svg { display: block; flex: none; }
   padding: 0 14px 0 42px; font-size: 16px; outline: none;
 }
 .search input:focus { border-color: var(--accent); }
+.search input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .section { display: flex; justify-content: space-between; align-items: baseline; margin: 10px 4px 8px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
 .item {
   display: flex; align-items: center; gap: 14px; width: 100%; text-align: left; background: var(--surface);
@@ -156,7 +158,7 @@ svg { display: block; flex: none; }
 .tip span { flex: 1; }
 .fab {
   position: absolute; right: 18px; bottom: calc(20px + var(--sab)); height: 56px; padding: 0 22px 0 18px;
-  border-radius: 28px; background: linear-gradient(135deg, var(--accent-2), var(--accent)); color: #fff;
+  border-radius: 28px; background: linear-gradient(135deg, var(--accent-2), var(--accent)); color: var(--accent-ink);
   font-weight: 700; font-size: 17px; display: flex; align-items: center; gap: 8px;
   box-shadow: 0 8px 24px rgba(217, 72, 15, 0.38);
 }
@@ -169,6 +171,7 @@ textarea.text {
   padding: 10px 22px; font-family: var(--serif); font-size: 18px; line-height: 1.65;
 }
 textarea.text::placeholder { color: var(--muted); }
+textarea.text:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .paste {
   position: absolute; top: 14px; left: 50%; transform: translateX(-50%); height: 44px; padding: 0 20px;
   border-radius: 22px; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow-card);
@@ -187,9 +190,10 @@ textarea.text::placeholder { color: var(--muted); }
   max-width: 200px; height: 40px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface);
   padding: 0 10px; font-size: 15px; color: var(--ink);
 }
+.voice-status { padding: 6px 0 8px; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .cta { padding: 10px 16px calc(14px + var(--sab)); display: flex; gap: 10px; background: var(--bg); }
 .btn {
-  flex: 1; height: 54px; border-radius: 18px; color: #fff; font-size: 18px; font-weight: 700;
+  flex: 1; height: 54px; border-radius: 18px; color: var(--accent-ink); font-size: 18px; font-weight: 700;
   background: linear-gradient(135deg, var(--accent-2), var(--accent));
   display: flex; align-items: center; justify-content: center; gap: 8px;
   box-shadow: 0 6px 18px rgba(217, 72, 15, 0.28);
@@ -215,8 +219,8 @@ textarea.text::placeholder { color: var(--muted); }
 input[type="range"] { flex: 1; height: 32px; accent-color: var(--accent); margin: 0; }
 .controls { display: flex; align-items: center; justify-content: space-between; padding-top: 2px; }
 .play {
-  width: 64px; height: 64px; border-radius: 50%; color: #fff; display: grid; place-items: center;
-  background: linear-gradient(135deg, var(--accent-2), var(--accent)); box-shadow: 0 6px 18px rgba(217, 72, 15, 0.35);
+  width: 64px; height: 64px; border-radius: 50%; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--accent-2), var(--accent)); color: var(--accent-ink); box-shadow: 0 6px 18px rgba(217, 72, 15, 0.35);
 }
 .play:active { transform: scale(0.95); }
 .chip { min-width: 54px; height: 40px; padding: 0 10px; border-radius: 12px; font-weight: 700; font-size: 15px; border: 1px solid var(--line); background: var(--surface); }

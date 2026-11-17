@@ -1,6 +1,6 @@
 import './style.css';
 import * as db from './db.js';
-import { VOICES, DEFAULT_VOICE, MAX_WORDS, countWords, clampWords, hashOf, generateAudio } from './tts.js';
+import { VOICES, DEFAULT_VOICE, MAX_WORDS, countWords, isWithinWordLimit, voiceIsOnDevice, hashOf, generateAudio } from './tts.js';
 
 /* ---------- icons & logo ---------- */
 const svg = (d, size = 24, extra = '') =>
@@ -70,6 +70,9 @@ const app = $('#app');
 function toast(msg, ms = 2800) {
   const el = document.createElement('div');
   el.className = 'toast';
+  el.setAttribute('role', 'status');
+  el.setAttribute('aria-live', 'polite');
+  el.setAttribute('aria-atomic', 'true');
   el.textContent = msg;
   app.appendChild(el);
   setTimeout(() => el.remove(), ms);
@@ -80,15 +83,68 @@ function openSheet(html) {
   const ov = document.createElement('div');
   ov.className = 'overlay';
   ov.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${html}</div>`;
+  const dialog = $('.sheet', ov);
+  dialog.setAttribute('tabindex', '-1');
+  const heading = $('h2', dialog);
+  if (heading) {
+    if (!heading.id) heading.id = `dialog-title-${++openSheet.nextId}`;
+    dialog.setAttribute('aria-labelledby', heading.id);
+  } else dialog.setAttribute('aria-label', 'ListenList dialog');
+  const previous = document.activeElement;
+  let closed = false;
+  let onEscape = () => close();
+  const focusable = () =>
+    [...dialog.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter((el) => el.getClientRects().length);
+  const onKeydown = (e) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      onEscape();
+      return;
+    }
+    if (e.key !== 'Tab') return;
+    const items = focusable();
+    if (!items.length) {
+      e.preventDefault();
+      dialog.focus();
+    } else if (e.shiftKey && document.activeElement === items[0]) {
+      e.preventDefault();
+      items.at(-1).focus();
+    } else if (!e.shiftKey && document.activeElement === items.at(-1)) {
+      e.preventDefault();
+      items[0].focus();
+    }
+  };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', onKeydown);
+    ov.remove();
+    previous?.focus?.();
+  };
   app.appendChild(ov);
-  return { el: ov, close: () => ov.remove() };
+  document.addEventListener('keydown', onKeydown);
+  (focusable()[0] || dialog).focus();
+  return {
+    el: ov,
+    close,
+    set onEscape(fn) {
+      onEscape = fn;
+    },
+  };
 }
+openSheet.nextId = 0;
 function confirmSheet({ title, text, action }) {
   return new Promise((resolve) => {
     const s = openSheet(`<h2>${esc(title)}</h2><p>${esc(text)}</p>
       <div class="cta" style="padding:0"><button class="btn secondary" id="no" style="flex:1">Cancel</button><button class="btn" id="yes">${esc(action)}</button></div>`);
-    $('#no', s.el).onclick = () => (s.close(), resolve(false));
-    $('#yes', s.el).onclick = () => (s.close(), resolve(true));
+    const finish = (answer) => {
+      s.close();
+      resolve(answer);
+    };
+    s.onEscape = () => finish(false);
+    $('#no', s.el).onclick = () => finish(false);
+    $('#yes', s.el).onclick = () => finish(true);
   });
 }
 function errorSheet(title, text, retry) {
@@ -110,6 +166,9 @@ audio.preload = 'auto';
 let saveTimer = null;
 let activeCue = -1;
 let dragging = false;
+let generationActive = false;
+let storageIssue = null;
+let voiceCheck = 0;
 let speed = Number(store.get('speed', 1)) || 1;
 const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
@@ -125,6 +184,7 @@ const isStandalone = () => navigator.standalone || (matchMedia && matchMedia('(d
 
 function renderHome() {
   stopPlayback();
+  releaseAudioUrl();
   cur = null;
   app.innerHTML = `
     <section class="screen" id="home">
@@ -140,12 +200,21 @@ function renderHomeBody() {
   const box = $('#scroll');
   if (!box) return;
   const sorted = [...lists].sort((a, b) => b.updatedAt - a.updatedAt);
-  $('#new')?.classList.toggle('hidden', !sorted.length);
+  $('#new')?.classList.toggle('hidden', !sorted.length || !!storageIssue);
+
+  if (storageIssue) {
+    box.innerHTML = `<div class="empty">
+      <h2>Could not load your lists</h2>
+      <p>Your saved lists may still be in this browser. Check local storage access and try again.</p>
+      <button class="btn" id="retryStorage">Try again</button></div>`;
+    $('#retryStorage').onclick = boot;
+    return;
+  }
 
   if (!sorted.length) {
     box.innerHTML = `<div class="empty">${EMPTY_ART}
       <h2>No lists yet</h2>
-      <p>Create a list, paste your text (up to ${MAX_WORDS.toLocaleString()} words) and press Listen. Your audio is saved on this device so it plays offline.</p>
+      <p>Create a list, paste your text (up to ${MAX_WORDS.toLocaleString()} words) and press Listen. Each voice needs an initial download; completed audio is saved on this device.</p>
       <button class="btn" id="first">${I.plus} Create your first list</button></div>`;
     $('#first').onclick = newList;
     return;
@@ -155,7 +224,7 @@ function renderHomeBody() {
   const showSearch = sorted.length >= 6;
   box.innerHTML = `
     ${showTip ? `<div class="tip" id="tip"><span><b>Tip:</b> tap Share, then <b>Add to Home Screen</b> to use ListenList like an app.</span><button class="icon-btn" id="tipx" aria-label="Dismiss">${I.close}</button></div>` : ''}
-    ${showSearch ? `<label class="search">${I.search}<input id="q" type="search" placeholder="Search your lists" value="${esc(query)}" autocomplete="off" /></label>` : ''}
+    ${showSearch ? `<label class="search">${I.search}<input id="q" type="search" aria-label="Search your lists" placeholder="Search your lists" value="${esc(query)}" autocomplete="off" /></label>` : ''}
     <div class="section"><span id="secLabel"></span></div>
     <div id="items"></div>
     <div class="foot" id="foot"></div>`;
@@ -205,8 +274,13 @@ function itemHtml(l) {
 async function newList() {
   const saved = store.get('voice', DEFAULT_VOICE);
   const l = { id: uid(), title: '', text: '', voice: VOICES.some((v) => v.id === saved) ? saved : DEFAULT_VOICE, updatedAt: Date.now(), audio: null };
+  try {
+    await db.putList(l);
+  } catch (err) {
+    errorSheet('Could not create a list', err?.message || 'Check that this browser allows local storage, then try again.', newList);
+    return;
+  }
   lists.push(l);
-  await db.putList(l);
   openList(l.id, true);
 }
 
@@ -215,7 +289,12 @@ async function openList(id, isNew = false) {
   cur = lists.find((l) => l.id === id);
   if (!cur) return renderHome();
   curAudio = null;
-  if (cur.audio) curAudio = (await db.getAudio(id)) || null;
+  try {
+    if (cur.audio) curAudio = (await db.getAudio(id)) || null;
+  } catch (err) {
+    errorSheet('Could not open this list', err?.message || 'The saved audio or list could not be read.', () => openList(id, isNew));
+    return;
+  }
   if (!curAudio) cur.audio = null;
   mode = audioStatus(cur) === 'ready' && !isNew ? 'read' : 'write';
   renderEditor();
@@ -224,20 +303,21 @@ async function openList(id, isNew = false) {
 
 function renderEditor() {
   stopPlayback();
+  if (mode !== 'read') releaseAudioUrl();
   if (mode === 'read') return renderReader();
   const st = audioStatus(cur);
   app.innerHTML = `
     <section class="screen" id="editor">
       <div class="bar">
         <button class="icon-btn" id="back" aria-label="Back to lists">${I.back}</button>
-        <input class="title-input" id="title" placeholder="List name" value="${esc(cur.title)}" maxlength="80" enterkeyhint="done" />
+        <input class="title-input" id="title" aria-label="List name" placeholder="List name" value="${esc(cur.title)}" maxlength="80" enterkeyhint="done" />
         <button class="icon-btn danger" id="del" aria-label="Delete list">${I.trash}</button>
       </div>
       <div class="editor-body">
-        <textarea class="text" id="text" placeholder="Paste or type your text here…" autocapitalize="sentences" spellcheck="true"></textarea>
+        <textarea class="text" id="text" aria-label="Text to read aloud" aria-describedby="count note" placeholder="Paste or type your text here…" autocapitalize="sentences" spellcheck="true"></textarea>
         <button class="paste hidden" id="paste">${I.paste} Paste from clipboard</button>
       </div>
-      <div class="note" id="note"></div>
+      <div class="note" id="note" role="status" aria-live="polite" aria-atomic="true"></div>
       <div class="panel">
         <div class="meter" id="meter"><i></i></div>
         <div class="meta">
@@ -246,6 +326,7 @@ function renderEditor() {
             <select id="voice" aria-label="Voice">${VOICES.map((v) => `<option value="${v.id}" ${v.id === cur.voice ? 'selected' : ''}>${v.label}</option>`).join('')}</select>
           </label>
         </div>
+        <div class="voice-status" id="voiceStatus" role="status" aria-live="polite"></div>
       </div>
       <div class="cta">
         ${st === 'ready' ? `<button class="btn secondary" id="regen">Re-create</button>` : ''}
@@ -255,14 +336,19 @@ function renderEditor() {
   const ta = $('#text');
   ta.value = cur.text;
   updateEditorMeta();
+  updateVoiceAvailability(cur.voice);
 
   $('#back').onclick = () => finishEditing();
   $('#del').onclick = async () => {
     const ok = await confirmSheet({ title: 'Delete this list?', text: `“${cur.title || 'Untitled'}” and its audio will be removed from this device.`, action: 'Delete' });
     if (!ok) return;
-    await db.deleteList(cur.id);
-    lists = lists.filter((l) => l.id !== cur.id);
-    renderHome();
+    try {
+      await db.deleteList(cur.id);
+      lists = lists.filter((l) => l.id !== cur.id);
+      renderHome();
+    } catch (err) {
+      errorSheet('Could not delete this list', err?.message || 'The list is still available. Please try again.', () => $('#del')?.click());
+    }
   };
   $('#title').oninput = (e) => {
     cur.title = e.target.value;
@@ -272,11 +358,6 @@ function renderEditor() {
     if (e.key === 'Enter') ta.focus();
   };
   ta.oninput = () => {
-    const clamped = clampWords(ta.value);
-    if (clamped !== ta.value) {
-      ta.value = clamped;
-      toast(`Limit is ${MAX_WORDS.toLocaleString()} words — the rest was trimmed.`, 3600);
-    }
     cur.text = ta.value;
     updateEditorMeta();
     scheduleSave();
@@ -285,7 +366,7 @@ function renderEditor() {
     try {
       const t = await navigator.clipboard.readText();
       if (!t.trim()) return toast('The clipboard is empty.');
-      ta.value = clampWords((ta.value ? ta.value + '\n\n' : '') + t.trim());
+      ta.value = (ta.value ? ta.value + '\n\n' : '') + t.trim();
       ta.dispatchEvent(new Event('input'));
     } catch {
       toast('Could not read the clipboard. Tap and hold in the text area, then choose Paste.', 4200);
@@ -296,6 +377,7 @@ function renderEditor() {
     cur.voice = e.target.value;
     store.set('voice', cur.voice);
     updateEditorMeta();
+    updateVoiceAvailability(cur.voice);
     scheduleSave();
   };
   $('#listen').onclick = onListen;
@@ -304,23 +386,55 @@ function renderEditor() {
 
 function updateEditorMeta() {
   const words = countWords(cur.text);
+  const overLimit = !isWithinWordLimit(cur.text);
   const c = $('#count');
   c.textContent = `${words.toLocaleString()} / ${MAX_WORDS.toLocaleString()} words`;
-  c.classList.toggle('full', words >= MAX_WORDS);
+  c.classList.toggle('full', overLimit);
   const m = $('#meter');
-  m.classList.toggle('full', words >= MAX_WORDS);
+  m.classList.toggle('full', overLimit);
   $('i', m).style.width = Math.min(100, (words / MAX_WORDS) * 100) + '%';
   const st = audioStatus(cur);
   $('#listenLabel').textContent = st === 'ready' ? 'Play' : 'Listen';
-  $('#listen').disabled = !words;
+  $('#listen').disabled = !words || overLimit;
   $('#paste').classList.toggle('hidden', words > 0 || !(navigator.clipboard && navigator.clipboard.readText));
-  $('#note').textContent = st === 'stale' ? 'Text or voice changed — the audio will be re-created when you press Listen.' : '';
+  $('#note').textContent = overLimit
+    ? `Your full text stays in this draft. Shorten it to ${MAX_WORDS.toLocaleString()} words or fewer to create audio.`
+    : st === 'stale'
+      ? 'Text or voice changed — the audio will be re-created when you press Listen.'
+      : '';
+}
+
+async function updateVoiceAvailability(voiceId) {
+  const check = ++voiceCheck;
+  const status = $('#voiceStatus');
+  if (!status) return;
+  status.textContent = 'Checking whether this voice is already on this device…';
+  try {
+    const available = await voiceIsOnDevice(voiceId);
+    if (check !== voiceCheck || !$('#voiceStatus')) return;
+    $('#voiceStatus').textContent = available
+      ? 'Voice files are stored on this device.'
+      : 'First use needs internet to download this voice (about 60 MB). Each voice downloads separately.';
+  } catch (err) {
+    if (check === voiceCheck && $('#voiceStatus')) {
+      $('#voiceStatus').textContent = `Could not check voice storage: ${err?.message || 'try again later.'}`;
+    }
+  }
 }
 
 function scheduleSave() {
-  cur.updatedAt = Date.now();
+  const target = cur;
+  if (!target) return;
+  target.updatedAt = Date.now();
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => db.putList(cur), 350);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    db.putList(target).catch((err) => {
+      if (cur === target) {
+        errorSheet('Could not save your changes', err?.message || 'Your current edits are still on screen. Check browser storage and retry.', () => scheduleSave());
+      }
+    });
+  }, 150);
 }
 
 async function finishEditing() {
@@ -328,19 +442,38 @@ async function finishEditing() {
   if (cur) {
     if (!cur.title.trim()) cur.title = cur.text.trim().split(/\s+/).slice(0, 5).join(' ') || 'Untitled';
     if (!cur.text.trim() && !cur.audio) {
-      // discard completely empty lists
-      await db.deleteList(cur.id);
+      try {
+        await db.deleteList(cur.id);
+      } catch (err) {
+        errorSheet('Could not save this list', err?.message || 'The empty list could not be removed.', () => finishEditing());
+        return;
+      }
       lists = lists.filter((l) => l.id !== cur.id);
     } else {
-      await db.putList(cur);
+      try {
+        await db.putList(cur);
+      } catch (err) {
+        errorSheet('Could not save your changes', err?.message || 'Your edits are still on screen. Check browser storage and retry.', () => finishEditing());
+        return;
+      }
     }
   }
   renderHome();
 }
 
-function onListen() {
+async function onListen() {
+  if (!cur || generationActive) return;
+  if (!isWithinWordLimit(cur.text)) {
+    toast(`Shorten this draft to ${MAX_WORDS.toLocaleString()} words or fewer before creating audio.`, 3600);
+    return;
+  }
   clearTimeout(saveTimer);
-  db.putList(cur);
+  try {
+    await db.putList(cur);
+  } catch (err) {
+    errorSheet('Could not save your list', err?.message || 'Audio was not started. Check browser storage and try again.', () => onListen());
+    return;
+  }
   if (audioStatus(cur) === 'ready') {
     mode = 'read';
     renderEditor();
@@ -352,43 +485,62 @@ function onListen() {
 
 /* ---------- generation ---------- */
 async function startGeneration() {
+  if (!cur || generationActive) return;
   if (!countWords(cur.text)) return;
-  clearTimeout(saveTimer);
-  await db.putList(cur);
-  const sheet = openSheet(`
-    <h2 id="gTitle">Getting ready…</h2>
-    <p id="gSub">Keep this screen open while the audio is created on your device. Nothing is uploaded.</p>
-    <div class="bar-track"><div class="bar-fill" id="gFill"></div></div>
-    <div class="prog-meta"><span id="gLeft"></span><span id="gRight"></span></div>
-    <button class="btn secondary" id="gCancel" style="width:100%">Cancel</button>`);
-  const ov = sheet.el;
-  let cancelled = false;
-  $('#gCancel', ov).onclick = () => {
-    cancelled = true;
-    $('#gTitle', ov).textContent = 'Stopping…';
-  };
-
+  if (!isWithinWordLimit(cur.text)) {
+    toast(`Shorten this draft to ${MAX_WORDS.toLocaleString()} words or fewer before creating audio.`, 3600);
+    return;
+  }
+  generationActive = true;
+  const target = cur;
+  const controller = new AbortController();
+  let sheet = null;
   let wake = null;
   try {
-    wake = await navigator.wakeLock?.request('screen');
-  } catch {}
+    clearTimeout(saveTimer);
+    await db.putList(target);
+    sheet = openSheet(`
+    <h2 id="gTitle" role="status" aria-live="polite">Getting ready…</h2>
+    <p id="gSub" aria-live="polite" aria-atomic="true">Keep this screen open while the audio is created on your device.</p>
+    <div class="bar-track"><div class="bar-fill" id="gFill" role="progressbar" aria-label="Voice download and audio generation progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div></div>
+    <div class="prog-meta"><span id="gLeft"></span><span id="gRight"></span></div>
+    <button class="btn secondary" id="gCancel" style="width:100%">Cancel</button>`);
+    const ov = sheet.el;
+    const cancelGeneration = () => {
+      $('#gTitle', ov).textContent = 'Stopping…';
+      $('#gSub', ov).textContent = 'Cancelling the current download or generation…';
+      controller.abort();
+    };
+    $('#gCancel', ov).onclick = cancelGeneration;
+    sheet.onEscape = cancelGeneration;
 
-  const voice = cur.voice;
-  const text = cur.text;
-  const started = performance.now();
-  try {
+    try {
+      wake = await navigator.wakeLock?.request('screen');
+    } catch (err) {
+      console.warn('Could not keep the screen awake during generation.', err);
+    }
+    const voice = target.voice;
+    const text = target.text;
+    const started = performance.now();
     const res = await generateAudio({
       text,
       voiceId: voice,
-      isCancelled: () => cancelled,
+      signal: controller.signal,
       onStatus: (s) => {
         const fill = $('#gFill', ov);
         if (!fill) return;
         fill.classList.toggle('indeterminate', s.phase === 'engine');
-        if (s.phase !== 'engine') fill.style.width = s.percent + '%';
+        if (s.phase !== 'engine') {
+          fill.style.width = s.percent + '%';
+          fill.setAttribute('aria-valuenow', String(s.percent));
+          fill.removeAttribute('aria-valuetext');
+        } else {
+          fill.removeAttribute('aria-valuenow');
+          fill.setAttribute('aria-valuetext', 'Starting the voice engine');
+        }
         if (s.phase === 'model') {
-          $('#gTitle', ov).textContent = 'Downloading the voice (first time only)';
-          $('#gSub', ov).textContent = 'About 60 MB. It is saved on this device, so you will not need to download it again.';
+          $('#gTitle', ov).textContent = 'Downloading the voice';
+          $('#gSub', ov).textContent = 'About 60 MB. Saved in browser storage; it may need to be downloaded again if browser data is cleared or evicted.';
           $('#gLeft', ov).textContent = s.percent + '%';
           $('#gRight', ov).textContent = '';
         } else if (s.phase === 'engine') {
@@ -398,32 +550,42 @@ async function startGeneration() {
           $('#gRight', ov).textContent = '';
         } else {
           $('#gTitle', ov).textContent = 'Creating your audio';
-          $('#gSub', ov).textContent = 'Keep this screen open. Everything happens on your device — nothing is uploaded.';
+          $('#gSub', ov).textContent = 'Keep this screen open. Speech is generated on this device.';
           $('#gLeft', ov).textContent = `${s.percent}% · part ${s.done} of ${s.total}`;
           $('#gRight', ov).textContent = s.etaSec != null ? `about ${fmtMin(s.etaSec)} left` : 'estimating…';
         }
       },
     });
+    if (controller.signal.aborted) throw new DOMException('The operation was cancelled.', 'AbortError');
+    $('#gTitle', ov).textContent = 'Saving your audio…';
+    $('#gSub', ov).textContent = 'The speech is ready. Saving it to this device.';
+    $('#gCancel', ov).disabled = true;
+    sheet.onEscape = () => {};
     const hash = hashOf(text, voice);
-    curAudio = { id: cur.id, blob: res.blob, cues: res.cues, duration: res.duration, hash };
-    await db.putAudio(curAudio);
-    cur.audio = { hash, duration: res.duration, size: res.blob.size };
-    cur.updatedAt = Date.now();
-    await db.putList(cur);
-    navigator.storage?.persist?.();
+    const audioRecord = { id: target.id, blob: res.blob, cues: res.cues, duration: res.duration, hash };
+    const updatedList = { ...target, audio: { hash, duration: res.duration, size: res.blob.size }, updatedAt: Date.now() };
+    await db.putGeneratedAudio(updatedList, audioRecord);
+    target.audio = updatedList.audio;
+    target.updatedAt = updatedList.updatedAt;
+    curAudio = audioRecord;
+    try {
+      await navigator.storage?.persist?.();
+    } catch (err) {
+      console.warn('Could not request persistent browser storage.', err);
+    }
     sheet.close();
-    mode = 'read';
-    renderEditor();
-    toast(`Audio ready · made in ${fmtTime((performance.now() - started) / 1000)}`);
-    togglePlay(true);
+    if (cur === target) {
+      mode = 'read';
+      renderEditor();
+      toast(`Audio ready · made in ${fmtTime((performance.now() - started) / 1000)}`);
+      togglePlay(true);
+    }
   } catch (err) {
-    sheet.close();
-    if (String(err && err.message) !== 'cancelled') {
+    sheet?.close();
+    if (err?.name !== 'AbortError') {
       errorSheet(
-        navigator.onLine ? 'Could not create the audio' : 'You are offline',
-        navigator.onLine
-          ? (err && err.message ? err.message : 'Something went wrong.') + ' Try again, or pick another voice.'
-          : 'The first time you create audio you need internet to download the voice. After that it works offline.',
+        'Could not create or save the audio',
+        (err?.message || 'Something went wrong.') + ' Your text remains saved. Check available storage and your connection, then try again or choose another voice.',
         () => startGeneration()
       );
     }
@@ -431,6 +593,7 @@ async function startGeneration() {
     try {
       wake?.release();
     } catch {}
+    generationActive = false;
   }
 }
 
@@ -466,7 +629,7 @@ function renderReader() {
       </div>
     </section>`;
 
-  if (audioUrl) URL.revokeObjectURL(audioUrl);
+  releaseAudioUrl();
   audioUrl = URL.createObjectURL(curAudio.blob);
   audio.src = audioUrl;
   audio.playbackRate = speed;
@@ -506,6 +669,14 @@ function renderReader() {
   setupMediaSession();
 }
 
+function releaseAudioUrl() {
+  if (!audioUrl) return;
+  URL.revokeObjectURL(audioUrl);
+  audioUrl = null;
+  audio.removeAttribute('src');
+  audio.load();
+}
+
 function updateSpeedLabel() {
   const b = $('#speed');
   if (b) b.textContent = speed + '×';
@@ -523,7 +694,10 @@ function togglePlay(forcePlay) {
   if (!curAudio || mode !== 'read') return;
   if (forcePlay === true || audio.paused) {
     audio.playbackRate = speed;
-    audio.play().catch(() => {}); // iOS may block autoplay; the Play button still works
+    audio.play().catch((err) => {
+      setPlayIcon();
+      toast(err?.name === 'NotAllowedError' ? 'Tap Play to start audio.' : `Could not start playback: ${err?.message || 'try again.'}`);
+    });
   } else {
     audio.pause();
   }
@@ -559,11 +733,15 @@ function highlight(t) {
   const reader = $('#reader');
   if (!reader) return;
   const prev = reader.querySelector('.s.on');
-  if (prev) prev.classList.remove('on');
+  if (prev) {
+    prev.classList.remove('on');
+    prev.removeAttribute('aria-current');
+  }
   activeCue = idx;
   const el = idx >= 0 ? reader.querySelector(`.s[data-i="${idx}"]`) : null;
   if (el) {
     el.classList.add('on');
+    el.setAttribute('aria-current', 'location');
     if (!audio.paused || !dragging) {
       const r = el.getBoundingClientRect();
       const rr = reader.getBoundingClientRect();
@@ -644,34 +822,51 @@ function setupMediaSession() {
 
 async function saveAudioFile() {
   const name = (cur.title || 'listenlist').replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'listenlist';
-  const file = new File([curAudio.blob], name + '.wav', { type: 'audio/wav' });
   try {
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      await navigator.share({ files: [file], title: cur.title || 'ListenList' });
-      return;
+    const file = typeof File === 'function' ? new File([curAudio.blob], name + '.wav', { type: 'audio/wav' }) : null;
+    if (file && navigator.canShare && navigator.canShare({ files: [file] })) {
+      try {
+        await navigator.share({ files: [file], title: cur.title || 'ListenList' });
+        return;
+      } catch (err) {
+        if (err?.name === 'AbortError') return;
+      }
     }
+    const a = document.createElement('a');
+    a.href = audioUrl;
+    a.download = name + '.wav';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast(`Saved · ${fmtMB(curAudio.blob.size)}`);
   } catch (err) {
-    if (err && err.name === 'AbortError') return;
+    errorSheet('Could not save the audio file', err?.message || 'Try again or use a browser that supports WAV downloads.', () => saveAudioFile());
   }
-  const a = document.createElement('a');
-  a.href = audioUrl;
-  a.download = name + '.wav';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  toast(`Saved · ${fmtMB(curAudio.blob.size)}`);
 }
 
 /* ---------- boot ---------- */
-(async function boot() {
+async function boot() {
   try {
     lists = (await db.getAllLists()) || [];
-  } catch {
+    storageIssue = null;
+  } catch (err) {
     lists = [];
-    toast('Storage is unavailable in this browser mode (private browsing?).', 5000);
+    storageIssue = err?.message || 'Local storage is unavailable in this browser mode.';
   }
   renderHome();
   if ('serviceWorker' in navigator && import.meta.env.PROD) {
-    navigator.serviceWorker.register('/sw.js').catch(() => {});
+    navigator.serviceWorker.register('/sw.js').catch((err) => {
+      console.warn('Could not register the offline app worker.', err);
+    });
   }
-})();
+}
+
+boot();
+
+window.addEventListener('pagehide', () => {
+  if (mode !== 'write' || !cur) return;
+  clearTimeout(saveTimer);
+  db.putList(cur).catch((err) => {
+    console.error('Could not save the current draft while leaving the page.', err);
+  });
+});
