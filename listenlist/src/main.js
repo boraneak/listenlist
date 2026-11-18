@@ -1,6 +1,7 @@
 import './style.css';
 import * as db from './db.js';
 import { VOICES, DEFAULT_VOICE, MAX_WORDS, countWords, isWithinWordLimit, voiceIsOnDevice, hashOf, generateAudio } from './tts.js';
+import { generateLocalAIResult, getLocalAIAvailability } from './local-ai.js';
 
 /* ---------- icons & logo ---------- */
 const svg = (d, size = 24, extra = '') =>
@@ -169,6 +170,9 @@ let dragging = false;
 let generationActive = false;
 let storageIssue = null;
 let voiceCheck = 0;
+let aiCheck = 0;
+let aiAvailability = 'checking';
+let aiBusy = false;
 let speed = Number(store.get('speed', 1)) || 1;
 const SPEEDS = [0.75, 1, 1.25, 1.5, 1.75, 2];
 
@@ -317,6 +321,10 @@ function renderEditor() {
         <textarea class="text" id="text" aria-label="Text to read aloud" aria-describedby="count note" placeholder="Paste or type your text here…" autocapitalize="sentences" spellcheck="true"></textarea>
         <button class="paste hidden" id="paste">${I.paste} Paste from clipboard</button>
       </div>
+      <div class="editor-tools">
+        <button class="assist-btn" id="assist" disabled>On-device AI tools</button>
+        <span id="aiStatus" role="status" aria-live="polite">Checking browser support…</span>
+      </div>
       <div class="note" id="note" role="status" aria-live="polite" aria-atomic="true"></div>
       <div class="panel">
         <div class="meter" id="meter"><i></i></div>
@@ -337,6 +345,7 @@ function renderEditor() {
   ta.value = cur.text;
   updateEditorMeta();
   updateVoiceAvailability(cur.voice);
+  updateAIAvailability();
 
   $('#back').onclick = () => finishEditing();
   $('#del').onclick = async () => {
@@ -360,6 +369,7 @@ function renderEditor() {
   ta.oninput = () => {
     cur.text = ta.value;
     updateEditorMeta();
+    updateAssistButton();
     scheduleSave();
   };
   $('#paste').onclick = async () => {
@@ -381,7 +391,140 @@ function renderEditor() {
     scheduleSave();
   };
   $('#listen').onclick = onListen;
+  $('#assist').onclick = openAssistMenu;
   if ($('#regen')) $('#regen').onclick = () => startGeneration();
+}
+
+async function updateAIAvailability() {
+  const check = ++aiCheck;
+  const status = $('#aiStatus');
+  if (!status) return;
+  status.textContent = 'Checking browser support…';
+  try {
+    aiAvailability = await getLocalAIAvailability();
+    if (check !== aiCheck || !$('#aiStatus')) return;
+    status.textContent =
+      aiAvailability === 'available'
+        ? 'Private model ready on this device.'
+        : aiAvailability === 'downloadable' || aiAvailability === 'downloading'
+          ? 'A local model download may be needed on first use.'
+          : 'Built-in AI needs supported desktop Chrome and hardware.';
+    updateAssistButton();
+  } catch (err) {
+    if (check !== aiCheck || !$('#aiStatus')) return;
+    aiAvailability = 'unavailable';
+    status.textContent = `Could not check on-device AI: ${err?.message || 'try again later.'}`;
+    updateAssistButton();
+  }
+}
+
+function updateAssistButton() {
+  const button = $('#assist');
+  if (button) button.disabled = !cur?.text.trim() || aiAvailability === 'checking' || aiAvailability === 'unavailable' || aiBusy;
+}
+
+const AI_ACTIONS = [
+  { id: 'title', label: 'Suggest a title', resultTitle: 'Suggested title', applyLabel: 'Use title', apply: true },
+  { id: 'sections', label: 'Organize into sections', resultTitle: 'Organized text', applyLabel: 'Replace draft', apply: true },
+  { id: 'notes', label: 'Create reading notes', resultTitle: 'Reading notes', applyLabel: 'Copy notes' },
+  { id: 'questions', label: 'Create comprehension questions', resultTitle: 'Comprehension questions', applyLabel: 'Copy questions' },
+];
+
+function openAssistMenu() {
+  if (!cur || !cur.text.trim() || aiBusy || aiAvailability === 'unavailable') return;
+  const modelNote =
+    aiAvailability === 'available'
+      ? 'Your text is processed by the built-in model on this device.'
+      : 'The first use may download Chrome’s local model. It can take a few minutes; your text stays on this device.';
+  const sheet = openSheet(`<h2>On-device AI tools</h2><p>${esc(modelNote)} Review generated text before using it.</p>
+    <div class="assist-options">${AI_ACTIONS.map((item) => `<button class="btn secondary" data-ai-action="${item.id}">${esc(item.label)}</button>`).join('')}</div>
+    <button class="btn secondary assist-close" id="assistClose">Close</button>`);
+  $('#assistClose', sheet.el).onclick = () => sheet.close();
+  sheet.el.querySelectorAll('[data-ai-action]').forEach((button) => {
+    button.onclick = () => {
+      const action = AI_ACTIONS.find((item) => item.id === button.dataset.aiAction);
+      sheet.close();
+      runAssistAction(action);
+    };
+  });
+}
+
+async function runAssistAction(action) {
+  if (!action || !cur || aiBusy) return;
+  aiBusy = true;
+  updateAssistButton();
+  const target = cur;
+  const controller = new AbortController();
+  const progress = openSheet(`<h2>Working on your text…</h2><p id="assistProgress" role="status" aria-live="polite">Preparing the on-device model…</p>
+    <button class="btn secondary assist-close" id="assistCancel">Cancel</button>`);
+  const cancel = () => {
+    controller.abort();
+    progress.close();
+  };
+  progress.onEscape = cancel;
+  $('#assistCancel', progress.el).onclick = cancel;
+
+  try {
+    const result = await generateLocalAIResult({
+      action: action.id,
+      text: target.text,
+      signal: controller.signal,
+      onProgress: (message) => {
+        const status = $('#assistProgress', progress.el);
+        if (status) status.textContent = message;
+      },
+    });
+    if (controller.signal.aborted) return;
+    progress.close();
+    if (cur === target) showAssistResult(action, result, target);
+  } catch (err) {
+    progress.close();
+    if (err?.name !== 'AbortError') {
+      errorSheet('Could not use on-device AI', err?.message || 'The browser model could not process this text. Please try again.');
+    }
+  } finally {
+    aiBusy = false;
+    updateAssistButton();
+  }
+}
+
+function showAssistResult(action, result, target) {
+  const sheet = openSheet(`<h2>${esc(action.resultTitle)}</h2><p>Review the result before using it. The original draft is unchanged until you apply it.</p>
+    <textarea class="assist-result" id="assistResult" aria-label="${esc(action.resultTitle)}" readonly></textarea>
+    <div class="assist-result-actions">
+      <button class="btn secondary" id="assistResultClose">Close</button>
+      <button class="btn" id="assistApply">${esc(action.applyLabel)}</button>
+    </div>`);
+  const output = $('#assistResult', sheet.el);
+  output.value = result;
+  $('#assistResultClose', sheet.el).onclick = () => sheet.close();
+  $('#assistApply', sheet.el).onclick = async () => {
+    if (action.apply) {
+      if (cur !== target) {
+        sheet.close();
+        return;
+      }
+      if (action.id === 'title') {
+        $('#title').value = result;
+        $('#title').dispatchEvent(new Event('input'));
+      } else {
+        $('#text').value = result;
+        $('#text').dispatchEvent(new Event('input'));
+      }
+      sheet.close();
+      toast(action.id === 'title' ? 'Title updated.' : 'Draft updated.');
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(result);
+      sheet.close();
+      toast('Copied to clipboard.');
+    } catch (err) {
+      output.focus();
+      output.select();
+      toast(`Could not copy automatically: ${err?.message || 'select and copy the result.'}`, 4200);
+    }
+  };
 }
 
 function updateEditorMeta() {

@@ -177,6 +177,13 @@ textarea.text:focus-visible { outline: 2px solid var(--accent); outline-offset: 
   border-radius: 22px; background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow-card);
   display: flex; align-items: center; gap: 8px; font-weight: 650; color: var(--accent); margin-top: 38px;
 }
+.editor-tools { display: flex; align-items: center; gap: 10px; padding: 4px 16px 6px; }
+.assist-btn {
+  flex: none; min-height: 38px; border: 1px solid var(--line); border-radius: 12px; padding: 0 12px;
+  background: var(--surface); color: var(--accent); font-weight: 650; font-size: 13px;
+}
+.assist-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.editor-tools span { min-width: 0; color: var(--muted); font-size: 12px; line-height: 1.35; }
 .note { padding: 0 22px 8px; font-size: 13px; color: var(--accent); }
 .panel { border-top: 1px solid var(--line); background: var(--bg); padding: 10px 16px 0; }
 .meter { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; margin-bottom: 10px; }
@@ -231,6 +238,16 @@ input[type="range"] { flex: 1; height: 32px; accent-color: var(--accent); margin
 .sheet { width: 100%; background: var(--surface); border-radius: 28px 28px 0 0; padding: 24px 22px calc(22px + var(--sab)); }
 .sheet h2 { margin: 0 0 6px; font-size: 20px; letter-spacing: -0.01em; }
 .sheet p { margin: 0 0 18px; color: var(--muted); font-size: 15px; line-height: 1.45; }
+.assist-options { display: grid; gap: 8px; margin-bottom: 12px; }
+.assist-options .btn { min-height: 48px; height: auto; font-size: 15px; }
+.assist-close { width: 100%; justify-content: center; }
+.assist-result {
+  display: block; width: 100%; min-height: 190px; max-height: 45vh; resize: vertical; margin: 0 0 12px;
+  border: 1px solid var(--line); border-radius: 12px; padding: 12px; background: var(--bg);
+  font-family: var(--sans); font-size: 14px; line-height: 1.5;
+}
+.assist-result-actions { display: flex; gap: 10px; }
+.assist-result-actions .btn { min-width: 0; height: 48px; font-size: 15px; }
 .bar-track { height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; margin-bottom: 8px; }
 .bar-fill { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent-2), var(--accent)); border-radius: 5px; transition: width 0.25s; }
 .bar-fill.indeterminate { width: 40% !important; animation: slide 1.2s ease-in-out infinite; }

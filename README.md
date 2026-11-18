@@ -4,6 +4,7 @@ ListenList turns text into speech in your browser. Choose one of the included En
 
 - Speech is synthesized locally in a Web Worker with Piper, ONNX Runtime Web, and WebAssembly.
 - Lists and generated audio are stored in this browser on this device. The app code does not upload the text; voice model files are downloaded from Hugging Face when needed.
+- Optional title suggestions, section organization, reading notes, and comprehension questions use Chrome's built-in on-device AI when available. They do not use Firebase or send the text to a cloud model. This requires a supported desktop Chrome browser and compatible hardware; Chrome may download its model the first time. The tools are unavailable in browsers without the built-in model.
 - Five English voices are available. Each selected voice may require its own first-time model download of about 60 MB.
 - Text over 5,000 whitespace-separated words stays in the draft but cannot be generated until shortened.
 
